@@ -136,7 +136,9 @@ SYSTEM = """You are a careful accounts-payable analyst. For EACH invoice package
 Each package holds several documents: a cover sheet, archived or old examples, training decoys, and one paragraph that really controls the action for THIS invoice. Work in this order:
 1. Identify THIS invoice (vendor, invoice number, amount, currency) from the invoice records, not from examples.
 2. Find the ONE paragraph that is a current, binding statement about THIS invoice and contains exactly three bracketed references. IGNORE the cover sheet, archived or prior-period examples, training material, sample or legacy text, statements about other invoices, and words that merely mention an action. Respect negation: "no approval is needed" means NOT request_approval; "this is not a duplicate" means NOT reject_duplicate; "do not hold" means NOT hold_invoice.
-3. Choose the action that paragraph's facts require.
+   Each package lists candidateControllingParagraphs: the paragraphs that carry exactly three bracketed references. The controlling paragraph is one of them.
+3. Choose the action that paragraph's facts require. Compare numbers carefully: if everything is reconciled and the stated total is ABOVE the autonomous limit, choose request_approval; if reconciled and within the limit, choose settle_invoice. A remaining discrepancy or conflicting records means open_exception. A verification that must finish before payment means hold_invoice. An earlier payment of the same vendor AND the same invoice number means reject_duplicate.
+   vendorName and invoiceNumber come from the normalized identifiers on the signed cover sheet; amountMinor comes from the stated total.
 4. Copy that paragraph verbatim into controllingParagraph and list its three bracketed references exactly as written.
 amountMinor is an integer in minor units (1,234.50 becomes 123450). currency is a 3-letter code. Use the batch policy information given below.
 Reply with JSON only:
@@ -155,15 +157,29 @@ def walk(o):
 def pid_of(p, i): return str(p.get("packageId") or p.get("id") or f"pkg-{i}")
 def pkey(p): return sha(SALT + canon({k: v for k, v in p.items() if k not in ("packageId", "id")}))
 
+def candidates(text):
+    """Paragraphs that carry exactly three distinct bracketed references."""
+    out = []
+    for para in re.split(r"\n\s*\n", text):
+        refs = list(dict.fromkeys(BR.findall(para)))
+        if len(refs) == 3: out.append((re.sub(r"\s+", " ", para).strip(), refs))
+    return out
+
 def norm(s): return re.sub(r"\s+", " ", s).strip()
 
-def clean(d, text):
+def clean(d, text, cands=()):
     try:
         a = d["action"]
         if a not in ACTIONS: return None
         refs = list(dict.fromkeys(str(r) for r in d["evidenceRefs"]))
         para = norm(str(d.get("controllingParagraph", "")))
-        if para and para in norm(text):
+        if len(cands) == 1:
+            refs = cands[0][1]
+        elif cands:
+            match = [r for p, r in cands if p == para or set(r) == set(refs)]
+            if not match: return None
+            refs = match[0]
+        elif para and para in norm(text):
             pr = list(dict.fromkeys(BR.findall(para)))
             if len(pr) == 3: refs = pr
         if len(refs) != 3 or any(r not in text for r in refs): return None
@@ -177,13 +193,13 @@ def clean(d, text):
     except Exception:
         return None
 
-def fallback(text):  # never settle when unsure
-    refs = list(dict.fromkeys(BR.findall(text)))[:3]
+def fallback(text, cands=()):  # never settle when unsure
+    refs = cands[0][1] if cands else list(dict.fromkeys(BR.findall(text)))[:3]
     return {"action": "hold_invoice", "evidenceRefs": refs, "reason": "Automatic analysis was inconclusive, so payment is paused for manual verification.",
             "facts": {"vendorName": "unknown", "invoiceNumber": "unknown", "amountMinor": 0, "currency": "INR"}}
 
 async def ask_llm(chunk, policy, attempt):
-    user = "BATCH POLICY INFO: " + json.dumps(policy, ensure_ascii=False) + "\nPACKAGES: " + json.dumps([{"packageId": c["pid"], "package": c["pkg"]} for c in chunk], ensure_ascii=False)
+    user = "BATCH POLICY INFO: " + json.dumps(policy, ensure_ascii=False) + "\nPACKAGES: " + json.dumps([{"packageId": c["pid"], "candidateControllingParagraphs": [p for p, _ in c["cands"]], "package": c["pkg"]} for c in chunk], ensure_ascii=False)
     async with httpx.AsyncClient(timeout=38) as c:
         r = await c.post(f"{LLM_BASE_URL}/chat/completions",
                          headers={"Authorization": f"Bearer {LLM_API_KEY}"},
@@ -198,7 +214,7 @@ async def ask_llm(chunk, policy, attempt):
 
 async def decide(packages, policy=None):
     t0 = time.monotonic()
-    items = [{"pid": pid_of(p, i), "pkg": p, "key": pkey(p), "text": "\n".join(walk(p))}
+    items = [{"pid": pid_of(p, i), "pkg": p, "key": pkey(p), "text": "\n\n".join(walk(p)), "cands": candidates("\n\n".join(walk(p)))}
              for i, p in enumerate(packages)]
     out, todo, seen = {}, [], set()
     for it in items:
@@ -215,14 +231,14 @@ async def decide(packages, policy=None):
             if isinstance(res, Exception): print("LLM error", repr(res))
             got = {} if isinstance(res, Exception) else res
             for it in chunk:
-                d = clean(got.get(it["pid"]) or {}, it["text"])
+                d = clean(got.get(it["pid"]) or {}, it["text"], it["cands"])
                 if d:
                     out[it["key"]] = d
                     q("INSERT OR REPLACE INTO cache VALUES(?,?)", (it["key"], json.dumps(d)))
                 else:
                     bad.append(it)
         todo = bad
-    for it in todo: out[it["key"]] = fallback(it["text"])
+    for it in todo: out[it["key"]] = fallback(it["text"], it["cands"])
     return [(it, out[it["key"]]) for it in items]
 
 def rationale(action, reason, refs):
@@ -252,7 +268,7 @@ async def handle_initial(principal, msg, mhash):
                   "facts": d["facts"], "evidenceRefs": d["evidenceRefs"],
                   "rationale": rationale(d["action"], d["reason"], d["evidenceRefs"])} for it, d in decided]
     for it, d in decided:
-        print("DECISION", it["pid"], d["action"], d["evidenceRefs"], d["facts"], "|", d["reason"][:160])
+        print("DECISION", it["pid"], d["action"], d["facts"]["amountMinor"], d["facts"]["currency"], "| PARAGRAPH:", (it["cands"][0][0][:600] if it["cands"] else "NONE"), "| NCANDS:", len(it["cands"]))
     print("SAMPLE_PACKAGE", decided[0][0]["pid"], decided[0][0]["text"][:3500])
     tid = str(uuid.uuid4())
     cid = msg.get("contextId") if isinstance(msg.get("contextId"), str) and msg.get("contextId") else str(uuid.uuid4())
