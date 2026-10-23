@@ -126,17 +126,22 @@ def guard(request: Request):
     return sha(p[1].strip())  # principal = hash of token (each token = separate user)
 
 # ---------------------------------------------------------------- AI layer
-SYSTEM = """You are an accounts-payable analyst. For EACH invoice package choose exactly one action:
-- settle_invoice: invoice is valid, reconciled, and within autonomous approval authority.
-- request_approval: commercially valid, but outside delegated authority (amount/limit too high).
-- hold_invoice: payment pauses until a stated verification completes (e.g. bank-detail callback, missing receipt).
-- reject_duplicate: the SAME commercial invoice (same vendor, invoice number, amount) was already paid. A payment for a DIFFERENT invoice is NOT a duplicate.
-- open_exception: material records conflict (amounts, vendor, PO, currency) and need an exception workflow.
-Each package has a cover sheet, archived examples, training decoys, negations, and irrelevant action words. IGNORE the cover sheet, archive examples, training decoys and any negated statement. Find the one paragraph that really determines the action for THIS invoice.
-evidenceRefs = exactly the three bracketed references (like [ABC-12]) copied character-for-character from that paragraph.
-amountMinor = integer minor units (1,234.50 -> 123450). currency = 3-letter code.
+SYSTEM = """You are a careful accounts-payable analyst. For EACH invoice package choose exactly one action:
+- settle_invoice: the invoice is valid, reconciled to its records, and within autonomous approval authority.
+- request_approval: commercially valid, but the amount or terms are outside delegated authority, so a named approver must sign off.
+- hold_invoice: payment pauses until a stated verification completes (for example a bank-detail callback, a missing receipt or a tax check).
+- reject_duplicate: the SAME commercial invoice (same vendor, same invoice number, same amount) was already paid. A payment for a DIFFERENT invoice number is NOT a duplicate.
+- open_exception: material records conflict (amounts, vendor, purchase order, currency) and need an exception workflow.
+
+Each package holds several documents: a cover sheet, archived or old examples, training decoys, and one paragraph that really controls the action for THIS invoice. Work in this order:
+1. Identify THIS invoice (vendor, invoice number, amount, currency) from the invoice records, not from examples.
+2. Find the ONE paragraph that is a current, binding statement about THIS invoice and contains exactly three bracketed references. IGNORE the cover sheet, archived or prior-period examples, training material, sample or legacy text, statements about other invoices, and words that merely mention an action. Respect negation: "no approval is needed" means NOT request_approval; "this is not a duplicate" means NOT reject_duplicate; "do not hold" means NOT hold_invoice.
+3. Choose the action that paragraph's facts require.
+4. Copy that paragraph verbatim into controllingParagraph and list its three bracketed references exactly as written.
+amountMinor is an integer in minor units (1,234.50 becomes 123450). currency is a 3-letter code. Use the batch policy information given below.
 Reply with JSON only:
-{"decisions":[{"packageId":"...","action":"...","vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR","evidenceRefs":["[..]","[..]","[..]"],"reason":"one or two sentences"}]}"""
+{"decisions":[{"packageId":"...","controllingParagraph":"...","reason":"one or two sentences explaining how the evidence supports the action","action":"...","vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR","evidenceRefs":["[..]","[..]","[..]"]}]}"""
+SALT = hashlib.sha256((SYSTEM + LLM_MODEL).encode()).hexdigest()[:8]
 
 BR = re.compile(r"\[[^\[\]\n]{1,80}\]")
 
@@ -148,13 +153,20 @@ def walk(o):
         for v in o: yield from walk(v)
 
 def pid_of(p, i): return str(p.get("packageId") or p.get("id") or f"pkg-{i}")
-def pkey(p): return sha(canon({k: v for k, v in p.items() if k not in ("packageId", "id")}))
+def pkey(p): return sha(SALT + canon({k: v for k, v in p.items() if k not in ("packageId", "id")}))
+
+def norm(s): return re.sub(r"\s+", " ", s).strip()
 
 def clean(d, text):
     try:
         a = d["action"]
+        if a not in ACTIONS: return None
         refs = list(dict.fromkeys(str(r) for r in d["evidenceRefs"]))
-        if a not in ACTIONS or len(refs) != 3 or any(r not in text for r in refs): return None
+        para = norm(str(d.get("controllingParagraph", "")))
+        if para and para in norm(text):
+            pr = list(dict.fromkeys(BR.findall(para)))
+            if len(pr) == 3: refs = pr
+        if len(refs) != 3 or any(r not in text for r in refs): return None
         amt = d["amountMinor"]
         if isinstance(amt, str): amt = int(re.sub(r"[^\d]", "", amt))
         if isinstance(amt, float): amt = int(round(amt))
@@ -170,12 +182,12 @@ def fallback(text):  # never settle when unsure
     return {"action": "hold_invoice", "evidenceRefs": refs, "reason": "Automatic analysis was inconclusive, so payment is paused for manual verification.",
             "facts": {"vendorName": "unknown", "invoiceNumber": "unknown", "amountMinor": 0, "currency": "INR"}}
 
-async def ask_llm(chunk):
-    user = json.dumps([{"packageId": c["pid"], "package": c["pkg"]} for c in chunk], ensure_ascii=False)
-    async with httpx.AsyncClient(timeout=28) as c:
+async def ask_llm(chunk, policy, attempt):
+    user = "BATCH POLICY INFO: " + json.dumps(policy, ensure_ascii=False) + "\nPACKAGES: " + json.dumps([{"packageId": c["pid"], "package": c["pkg"]} for c in chunk], ensure_ascii=False)
+    async with httpx.AsyncClient(timeout=38) as c:
         r = await c.post(f"{LLM_BASE_URL}/chat/completions",
                          headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-                         json={"model": LLM_MODEL, "temperature": 0,
+                         json={"model": LLM_MODEL, "temperature": 0.3 * attempt,
                                "response_format": {"type": "json_object"},
                                "messages": [{"role": "system", "content": SYSTEM},
                                             {"role": "user", "content": user}]})
@@ -184,7 +196,7 @@ async def ask_llm(chunk):
     txt = re.sub(r"^```(?:json)?|```$", "", txt, flags=re.M).strip()
     return {str(d.get("packageId")): d for d in json.loads(txt)["decisions"]}
 
-async def decide(packages):
+async def decide(packages, policy=None):
     t0 = time.monotonic()
     items = [{"pid": pid_of(p, i), "pkg": p, "key": pkey(p), "text": "\n".join(walk(p))}
              for i, p in enumerate(packages)]
@@ -197,7 +209,7 @@ async def decide(packages):
     for attempt in range(2):
         if not todo or (attempt == 1 and time.monotonic() - t0 > 14): break
         chunks = [todo[i:i + 12] for i in range(0, len(todo), 12)]
-        results = await asyncio.gather(*[ask_llm(c) for c in chunks], return_exceptions=True)
+        results = await asyncio.gather(*[ask_llm(c, policy or {}, attempt) for c in chunks], return_exceptions=True)
         bad = []
         for chunk, res in zip(chunks, results):
             if isinstance(res, Exception): print("LLM error", repr(res))
@@ -235,7 +247,7 @@ async def handle_initial(principal, msg, mhash):
         raise ApiError(400, "INVALID_MESSAGE", "Invalid batch")
     pk = data["packages"]
     print("BATCH", data["batchId"], len(pk), "first package keys:", list(pk[0].keys()) if isinstance(pk[0], dict) else type(pk[0]))
-    decided = await decide(pk)
+    decided = await decide(pk, {k: v for k, v in data.items() if k != "packages"})
     proposals = [{"packageId": it["pid"], "actionId": "act-" + uuid.uuid4().hex, "action": d["action"],
                   "facts": d["facts"], "evidenceRefs": d["evidenceRefs"],
                   "rationale": rationale(d["action"], d["reason"], d["evidenceRefs"])} for it, d in decided]
