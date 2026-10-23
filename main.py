@@ -251,6 +251,9 @@ async def handle_initial(principal, msg, mhash):
     proposals = [{"packageId": it["pid"], "actionId": "act-" + uuid.uuid4().hex, "action": d["action"],
                   "facts": d["facts"], "evidenceRefs": d["evidenceRefs"],
                   "rationale": rationale(d["action"], d["reason"], d["evidenceRefs"])} for it, d in decided]
+    for it, d in decided:
+        print("DECISION", it["pid"], d["action"], d["evidenceRefs"], d["facts"], "|", d["reason"][:160])
+    print("SAMPLE_PACKAGE", decided[0][0]["pid"], decided[0][0]["text"][:3500])
     tid = str(uuid.uuid4())
     cid = msg.get("contextId") if isinstance(msg.get("contextId"), str) and msg.get("contextId") else str(uuid.uuid4())
     task = {"id": tid, "contextId": cid,
