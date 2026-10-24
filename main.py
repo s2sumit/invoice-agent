@@ -158,11 +158,26 @@ def pid_of(p, i): return str(p.get("packageId") or p.get("id") or f"pkg-{i}")
 def pkey(p): return sha(SALT + canon({k: v for k, v in p.items() if k not in ("packageId", "id")}))
 
 def candidates(text):
-    """Paragraphs that carry exactly three distinct bracketed references."""
-    out = []
-    for para in re.split(r"\n\s*\n", text):
-        refs = list(dict.fromkeys(BR.findall(para)))
-        if len(refs) == 3: out.append((re.sub(r"\s+", " ", para).strip(), refs))
+    """Find the controlling paragraph: three distinct bracketed refs together.
+    Stage 1: blank-line paragraphs. Stage 2: single lines. Stage 3: runs of
+    three consecutive ref-bearing sentences (for differently laid-out packages)."""
+    def pack(chunks):
+        out = []
+        for ch in chunks:
+            refs = list(dict.fromkeys(BR.findall(ch)))
+            if len(refs) == 3: out.append((re.sub(r"\s+", " ", ch).strip(), refs))
+        return out
+    out = pack(re.split(r"\n\s*\n", text))
+    if out: return out
+    out = pack(re.split(r"\n+", text))
+    if out: return out
+    sents = [x for x in re.split(r"(?<=[.!?])\s+|\n+", text) if x.strip()]
+    for i in range(len(sents) - 2):
+        win = sents[i:i + 3]
+        counts = [len(set(BR.findall(w))) for w in win]
+        if all(c == 1 for c in counts):
+            refs = list(dict.fromkeys(r for w in win for r in BR.findall(w)))
+            if len(refs) == 3: out.append((" ".join(win), refs))
     return out
 
 def norm(s): return re.sub(r"\s+", " ", s).strip()
@@ -238,7 +253,9 @@ async def decide(packages, policy=None):
                 else:
                     bad.append(it)
         todo = bad
-    for it in todo: out[it["key"]] = fallback(it["text"], it["cands"])
+    for it in todo:
+        print("FALLBACK", it["pid"], it["text"][:2500].replace("\n", " ## "))
+        out[it["key"]] = fallback(it["text"], it["cands"])
     return [(it, out[it["key"]]) for it in items]
 
 def rationale(action, reason, refs):
