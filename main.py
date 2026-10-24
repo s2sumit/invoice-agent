@@ -331,6 +331,7 @@ async def handle_continuation(principal, msg, mhash):
         save(task, principal, msg["messageId"], mhash)
         return task
 
+@app.post("/message:send")
 @app.post(PREFIX + "/message:send")
 async def message_send(request: Request):
     principal = guard(request)
@@ -357,6 +358,7 @@ async def message_send(request: Request):
             task = await handle_initial(principal, msg, mhash)
         return reply({"task": task})
 
+@app.get("/tasks/{task_id}")
 @app.get(PREFIX + "/tasks/{task_id}")
 async def get_task(task_id: str, request: Request):
     principal = guard(request)
@@ -364,6 +366,7 @@ async def get_task(task_id: str, request: Request):
     if not task: raise ApiError(404, "NOT_FOUND", "Task not found")
     return reply(task)
 
+@app.get("/tasks")
 @app.get(PREFIX + "/tasks")
 async def list_tasks(request: Request):
     principal = guard(request)
@@ -373,6 +376,7 @@ async def list_tasks(request: Request):
         out.append(json.loads(j)); size += len(j)
     return reply({"tasks": out})
 
+@app.post("/tasks/{task_id}:cancel")
 @app.post(PREFIX + "/tasks/{task_id}:cancel")
 async def cancel_task(task_id: str, request: Request):
     principal = guard(request)
