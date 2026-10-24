@@ -14,7 +14,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 # ---------------------------------------------------------------- config
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000/a2a/")  # EXACT string you submit
-PREFIX = urlparse(BASE_URL).path.rstrip("/")
+PREFIX = "/a2a"  # fixed, so a wrong BASE_URL setting can never move the routes
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
